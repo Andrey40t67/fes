@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Hand Pinch Physics — Webcam + MediaPipe + Three.js + Cannon‑es</title>
+  <style>
+    html, body { height: 100%; margin: 0; background: #000; overflow: hidden; font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
+    #webcam {
+      position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover;
+      transform: scaleX(-1); /* зеркалим селфи-видео */
+      z-index: 0; background: #000;
+    }
+    #three {
+      position: fixed; inset: 0; display: block; z-index: 1;
+      transform: scaleX(-1); /* чтобы 3D совпадало с зеркальным видео */
+    }
+    #ui {
+      position: fixed; left: 12px; top: env(safe-area-inset-top, 12px);
+      z-index: 2; color: #fff; background: rgba(0,0,0,.45); backdrop-filter: blur(6px);
+      padding: 10px 12px; border-radius: 10px; line-height: 1.35; user-select: none;
+      max-width: min(92vw, 540px);
+    }
+    #start {
+      appearance: none; border: none; background: #31c27c; color: #041; font-weight: 700;
+      padding: 10px 14px; border-radius: 8px; cursor: pointer; font-size: 14px;
+      box-shadow: 0 4px 16px rgba(0,0,0,.25);
+    }
+    #start[disabled] { opacity: .6; cursor: default; }
+    .kbd { display: inline-block; padding: 0 6px; border-radius: 4px; background: rgba(255,255,255,.12); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    #status { opacity: .85; }
+    #help { margin-top: 8px; font-size: 12.5px; opacity: .9; }
+    #badnews { position: fixed; inset: 0; display: none; place-items: center; z-index: 3; background: rgba(0,0,0,.85); color: #fff; text-align: center; padding: 24px; }
+    #badnews > div { max-width: 680px; }
+    a { color: #9ad; }
+  </style>
+
+  <!-- MediaPipe Hands (UMD, глобальные Hands и Camera — мы используем только Hands) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.min.js"></script>
+
+  <!-- Three.js (ES Modules) -->
+  <script type="module" crossorigin src="https://unpkg.com/three@0.160.0/build/three.module.js"></script>
+  <script type="module" crossorigin src="https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js"></script>
+
+  <!-- cannon-es (ES Modules) -->
+  <script type="module" crossorigin src="https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js"></script>
+</head>
+<body>
+  <video id="webcam" playsinline muted></video>
+  <canvas id="three"></canvas>
+
+  <div id="ui">
+    <div id="status">Статус: <span id="s">ожидание</span></div>
+    <div id="help">
+      <div><button id="start">Включить камеру</button></div>
+      <div style="margin-top:6px">
+        Щепок (большой+указательный) <b>захватывает</b> ближайший объект, разжатие — <b>отпускает</b>. Объекты подчиняются гравитации.
+      </div>
+      <div style="margin-top:6px">
+        Клавиши: <span class="kbd">N</span> — куб, <span class="kbd">M</span> — шар, <span class="kbd">F</span> — дождь из объектов,
+        <span class="kbd">R</span> — сброс сцены, <span class="kbd">H</span> — подсказки.
+      </div>
+    </div>
+
+    <div id="badnews"><div>
+      <h2>Нужен HTTPS и разрешение камеры</h2>
+      <p>Запустите через <code>https://</code> или <code>localhost</code>. Пример: <code>npx http-server</code> → открыть <code>http://localhost:8080</code>. Затем нажмите «Включить камеру» и разрешите доступ.</p>
+    </div></div>
+  </div>
+
+  <!-- Главная логика (одним модульным скриптом) -->
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+    import { OrbitControls } from 'https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js';
+    import * as CANNON from 'https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js';
+
+    // ---------- DOM ----------
+    const video = document.getElementById('webcam');
+    const canvas = document.getElementById('three');
+    const statusEl = document.getElementById('s');
+    const startBtn = document.getElementById('start');
+    const helpBox = document.getElementById('help');
+    const badnews = document.getElementById('badnews');
+
+    function setStatus(t) { statusEl.textContent = t; }
+
+    // ---------- THREE.js ----------
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.03, 100);
+    camera.position.set(0, 1.2, 2.3);
+
+    const amb = new THREE.AmbientLight(0xffffff, 0.6);
+    scene.add(amb);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.8);
+    dir.position.set(2, 4, 2);
+    dir.castShadow = true;
+    scene.add(dir);
+
+    const floorGeo = new THREE.PlaneGeometry(30, 30);
+    const floorMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, metalness: 0.0, roughness: 1.0 });
+    const floor = new THREE.Mesh(floorGeo, floorMat);
+    floor.rotation.x = -Math.PI / 2;
+    floor.receiveShadow = true;
+    scene.add(floor);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.enablePan = false;
+    controls.minDistance = 0.6;
+    controls.maxDistance = 6;
+
+    // ---------- CANNON (Physics) ----------
+    const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -9.82, 0), allowSleep: true });
+    world.broadphase = new CANNON.SAPBroadphase(world);
+    world.defaultContactMaterial.friction = 0.4;
+    world.defaultContactMaterial.restitution = 0.2;
+
+    const groundBody = new CANNON.Body({ mass: 0, shape: new CANNON.Plane(), material: new CANNON.Material('ground') });
+    groundBody.quaternion.setFromEuler(-Math.PI / 2, 0, 0);
+    world.addBody(groundBody);
+
+    const objects = []; // { mesh, body }
+    const tmpVec3 = new THREE.Vector3();
+    const raycaster = new THREE.Raycaster();
+
+    function addBox({ size = 0.16, position = new THREE.Vector3((Math.random()-0.5)*0.8, 1.4 + Math.random()*0.5, (Math.random()-0.5)*0.8) } = {}) {
+      const geo = new THREE.BoxGeometry(size, size, size);
+      const mat = new THREE.MeshStandardMaterial({ color: 0x88c7ff, roughness: 0.5, metalness: 0.1 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true; mesh.receiveShadow = true;
+      scene.add(mesh);
+      const shape = new CANNON.Box(new CANNON.Vec3(size/2, size/2, size/2));
+      const body = new CANNON.Body({ mass: 0.25, shape, position: new CANNON.Vec3(position.x, position.y, position.z) });
+      body.linearDamping = 0.03; body.angularDamping = 0.02;
+      world.addBody(body);
+      objects.push({ mesh, body });
+      return { mesh, body };
+    }
+    function addSphere({ radius = 0.11, position = new THREE.Vector3((Math.random()-0.5)*0.8, 1.4 + Math.random()*0.5, (Math.random()-0.5)*0.8) } = {}) {
+      const geo = new THREE.SphereGeometry(radius, 24, 16);
+      const mat = new THREE.MeshStandardMaterial({ color: 0xffb870, roughness: 0.45, metalness: 0.08 });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true; mesh.receiveShadow = true;
+      scene.add(mesh);
+      const shape = new CANNON.Sphere(radius);
+      const body = new CANNON.Body({ mass: 0.2, shape, position: new CANNON.Vec3(position.x, position.y, position.z) });
+      body.linearDamping = 0.04; body.angularDamping = 0.03;
+      world.addBody(body);
+      objects.push({ mesh, body });
+      return { mesh, body };
+    }
+    for (let i = 0; i < 6; i++) addBox();
+    for (let i = 0; i < 6; i++) addSphere();
+
+    // ---------- Рука (визуализация) ----------
+    const BONES = [
+      [0,1],[1,2],[2,3],[3,4],
+      [0,5],[5,6],[6,7],[7,8],
+      [0,9],[9,10],[10,11],[11,12],
+      [0,13],[13,14],[14,15],[15,16],
+      [0,17],[17,18],[18,19],[19,20],
+      [5,9],[9,13],[13,17]
+    ];
+    const JOINT_COUNT = 21;
+
+    const handGroup = new THREE.Group();
+    scene.add(handGroup);
+
+    const jointGeo = new THREE.SphereGeometry(0.008, 16, 12);
+    const jointMat = new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.35, depthWrite: false });
+    const joints = new THREE.InstancedMesh(jointGeo, jointMat, JOINT_COUNT);
+    joints.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    handGroup.add(joints);
+
+    const boneGeo = new THREE.CylinderGeometry(0.004, 0.004, 1, 8, 1, true);
+    const boneMat = new THREE.MeshStandardMaterial({ color: 0xffffff, transparent: true, opacity: 0.25, depthWrite: false });
+    const boneMeshes = BONES.map(() => {
+      const m = new THREE.Mesh(boneGeo, boneMat);
+      handGroup.add(m);
+      return m;
+    });
+
+    let smoothLandmarks = null;
+    const SMOOTH_ALPHA = 0.35;
+    function lerp(a, b, t) { return a + (b - a) * t; }
+
+    const DEPTH_BASE = 0.7;
+    const DEPTH_SCALE = 0.6;
+
+    function mpToWorld(x, y, z) {
+      const xInv = 1 - x;
+      const ndc = new THREE.Vector2(xInv * 2 - 1, (1 - y) * 2 - 1);
+      raycaster.setFromCamera(ndc, camera);
+      const depth = DEPTH_BASE + (-z) * DEPTH_SCALE;
+      const worldPoint = new THREE.Vector3();
+      raycaster.ray.at(depth, worldPoint);
+      return worldPoint;
+    }
+
+    function updateHandVisual(landmarks) {
+      if (!landmarks) { handGroup.visible = false; return; }
+      handGroup.visible = true;
+
+      if (!smoothLandmarks) {
+        smoothLandmarks = landmarks.map(p => ({...p}));
+      } else {
+        for (let i = 0; i < JOINT_COUNT; i++) {
+          smoothLandmarks[i].x = lerp(smoothLandmarks[i].x, landmarks[i].x, 1 - SMOOTH_ALPHA);
+          smoothLandmarks[i].y = lerp(smoothLandmarks[i].y, landmarks[i].y, 1 - SMOOTH_ALPHA);
+          smoothLandmarks[i].z = lerp(smoothLandmarks[i].z, landmarks[i].z, 1 - SMOOTH_ALPHA);
+        }
+      }
+
+      // суставы
+      const dummy = new THREE.Object3D();
+      for (let i = 0; i < JOINT_COUNT; i++) {
+        const p = smoothLandmarks[i];
+        const w = mpToWorld(p.x, p.y, p.z);
+        dummy.position.copy(w);
+        dummy.scale.setScalar(1);
+        dummy.quaternion.identity();
+        dummy.updateMatrix();
+        joints.setMatrixAt(i, dummy.matrix);
+      }
+      joints.instanceMatrix.needsUpdate = true;
+
+      // кости
+      const up = new THREE.Vector3(0, 1, 0);
+      for (let b = 0; b < BONES.length; b++) {
+        const [iA, iB] = BONES[b];
+        const A = smoothLandmarks[iA];
+        const B = smoothLandmarks[iB];
+        const Aw = mpToWorld(A.x, A.y, A.z);
+        const Bw = mpToWorld(B.x, B.y, B.z);
+        const dir = tmpVec3.copy(Bw).sub(Aw);
+        const len = Math.max(0.0001, dir.length());
+        const mid = tmpVec3.copy(Aw).addScaledVector(dir, 0.5);
+
+        const m = boneMeshes[b];
+        m.position.copy(mid);
+        m.scale.set(1, len, 1);
+        const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0,1,0), dir.normalize());
+        m.setRotationFromQuaternion(q);
+      }
+    }
+
+    // ---------- Pinch / Захват ----------
+    const PINCH_IDX = 8;  // указательный tip
+    const PINCH_TH  = 4;  // большой tip
+    let isPinching = false;
+    let pinchNdX = 0.5, pinchNdY = 0.5;
+    let grabbed = null; // { body, mesh, constraint, grabDist }
+    let lastAnchorPos = new CANNON.Vec3(0,0,0);
+    let lastAnchorVel = new CANNON.Vec3(0,0,0);
+
+    const handAnchor = new CANNON.Body({ mass: 0 });
+    handAnchor.type = CANNON.Body.KINEMATIC;
+    handAnchor.addShape(new CANNON.Sphere(0.001));
+    world.addBody(handAnchor);
+
+    function getMeshesArray() { return objects.map(o => o.mesh); }
+    function findIntersectAt(ndx, ndy) {
+      const xInv = 1 - ndx;
+      const ndc = { x: xInv * 2 - 1, y: (1 - ndy) * 2 - 1 };
+      raycaster.setFromCamera(ndc, camera);
+      const hits = raycaster.intersectObjects(getMeshesArray(), false);
+      return hits[0] || null;
+    }
+
+    function beginGrab(ndx, ndy) {
+      if (grabbed) return;
+      const hit = findIntersectAt(ndx, ndy);
+      if (!hit) return;
+
+      const dist = hit.distance;
+      const body = objects.find(o => o.mesh === hit.object)?.body;
+      if (!body) return;
+
+      const target = new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z);
+      const localPivot = body.pointToLocalFrame(target);
+      const constraint = new CANNON.PointToPointConstraint(body, localPivot, handAnchor, new CANNON.Vec3(0,0,0));
+      world.addConstraint(constraint);
+
+      grabbed = { body, mesh: hit.object, constraint, grabDist: dist };
+
+      // Инициализируем позицию/скорость якоря, чтобы не было "рывка" на первом кадре
+      lastAnchorPos.copy(target);
+      lastAnchorVel.set(0,0,0);
+      handAnchor.position.copy(target);
+      handAnchor.velocity.set(0,0,0);
+
+      setStatus('захватили объект');
+    }
+
+    function endGrab() {
+      if (!grabbed) return;
+      world.removeConstraint(grabbed.constraint);
+      grabbed = null;
+      setStatus('отпустили объект');
+    }
+
+    function updateAnchorFromPinch(dt) {
+      if (!isPinching || !grabbed) return;
+      const xInv = 1 - pinchNdX;
+      const ndc = new THREE.Vector2(xInv * 2 - 1, (1 - pinchNdY) * 2 - 1);
+      raycaster.setFromCamera(ndc, camera);
+      const p = new THREE.Vector3();
+      raycaster.ray.at(grabbed.grabDist, p);
+
+      const cur = new CANNON.Vec3(p.x, p.y, p.z);
+      lastAnchorVel.set(
+        (cur.x - lastAnchorPos.x) / Math.max(1e-3, dt),
+        (cur.y - lastAnchorPos.y) / Math.max(1e-3, dt),
+        (cur.z - lastAnchorPos.z) / Math.max(1e-3, dt)
+      );
+      lastAnchorPos.copy(cur);
+
+      handAnchor.position.copy(cur);
+      handAnchor.velocity.copy(lastAnchorVel);
+    }
+
+    // ---------- MediaPipe Hands (ручной цикл с getUserMedia) ----------
+    let hands = null;
+    let processing = false;
+    let lastLandmarks = null;
+    let rafId = 0;
+
+    async function initHands() {
+      // eslint-disable-next-line no-undef
+      hands = new Hands({
+        locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+      });
+      hands.setOptions({
+        selfieMode: true,
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+
+      hands.onResults((results) => {
+        const lm = results.multiHandLandmarks?.[0];
+        if (lm && lm.length === 21) {
+          lastLandmarks = lm;
+          processPinch(lastLandmarks);
+        } else {
+          lastLandmarks = null;
+          if (isPinching) endGrab();
+          isPinching = false;
+        }
+      });
+
+      const loop = async () => {
+        if (video.readyState >= 2 && !processing) {
+          processing = true;
+          try { await hands.send({ image: video }); }
+          catch (e) { console.error(e); }
+          finally { processing = false; }
+        }
+        rafId = requestAnimationFrame(loop);
+      };
+      loop();
+    }
+
+    function processPinch(lm) {
+      const a = lm[4];  // thumb tip
+      const b = lm[8];  // index tip
+      const cx = (a.x + b.x) * 0.5;
+      const cy = (a.y + b.y) * 0.5;
+      pinchNdX = cx; pinchNdY = cy;
+
+      const wrist = lm[0], midTip = lm[12];
+      const handScale = Math.hypot(wrist.x - midTip.x, wrist.y - midTip.y);
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      const THRESH = Math.max(0.03, 0.55 * handScale);
+
+      const nowPinch = dist < THRESH;
+      if (nowPinch && !isPinching) beginGrab(pinchNdX, pinchNdY);
+      else if (!nowPinch && isPinching) endGrab();
+      isPinching = nowPinch;
+    }
+
+    // ---------- Рендер/Физика ----------
+    let lastTime = performance.now();
+    function animate() {
+      const now = performance.now();
+      const dt = Math.min(0.033, (now - lastTime) / 1000);
+      lastTime = now;
+
+      controls.update();
+      updateAnchorFromPinch(dt);
+      world.step(1/60, dt, 3);
+
+      for (const { mesh, body } of objects) {
+        mesh.position.set(body.position.x, body.position.y, body.position.z);
+        mesh.quaternion.set(body.quaternion.x, body.quaternion.y, body.quaternion.z, body.quaternion.w);
+      }
+
+      updateHandVisual(lastLandmarks);
+      renderer.render(scene, camera);
+      requestAnimationFrame(animate);
+    }
+    requestAnimationFrame(animate);
+
+    // ---------- Утилиты ----------
+    function rain(count = 14) {
+      for (let i = 0; i < count; i++) {
+        (Math.random() < 0.5 ? addBox : addSphere)({
+          position: new THREE.Vector3((Math.random()-0.5)*2.5, 2.2 + Math.random()*0.4, (Math.random()-0.5)*2.5)
+        });
+      }
+    }
+    function resetScene() {
+      endGrab();
+      for (const o of objects) {
+        scene.remove(o.mesh);
+        world.removeBody(o.body);
+      }
+      objects.length = 0;
+      for (let i = 0; i < 6; i++) addBox();
+      for (let i = 0; i < 6; i++) addSphere();
+      setStatus('сцена сброшена');
+    }
+
+    window.addEventListener('resize', () => {
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'n' || e.key === 'N') addBox();
+      if (e.key === 'm' || e.key === 'M') addSphere();
+      if (e.key === 'f' || e.key === 'F') rain();
+      if (e.key === 'r' || e.key === 'R') resetScene();
+      if (e.key === 'h' || e.key === 'H') helpBox.style.display = (helpBox.style.display === 'none' ? '' : 'none');
+    });
+
+    // ---------- Кнопка «Включить камеру» — теперь 100% вызывает prompt ----------
+    startBtn.addEventListener('click', startApp);
+
+    async function startApp() {
+      startBtn.disabled = true;
+      try {
+        if (!navigator.mediaDevices?.getUserMedia) throw new Error('getUserMedia недоступен');
+        if (!isSecureContext && location.hostname !== 'localhost') throw new Error('страница не в защищённом контексте');
+
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        if (!devices.some(d => d.kind === 'videoinput')) throw new Error('камера не найдена');
+
+        setStatus('запрашиваем камеру…');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } },
+          audio: false
+        });
+
+        video.srcObject = stream;
+        await video.play(); // критично для iOS/мобилок
+
+        await initHands();
+        setStatus('камера активна, распознаём руку…');
+        badnews.style.display = 'none';
+      } catch (err) {
+        console.error(err);
+        setStatus('ошибка: ' + (err?.message || err));
+        badnews.style.display = 'grid';
+        startBtn.disabled = false;
+      }
+    }
+
+    // Автоподсказка, если не https
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+      badnews.style.display = 'grid';
+    }
+
+    // Чистка при уходе со страницы
+    window.addEventListener('beforeunload', () => {
+      try {
+        const s = video.srcObject;
+        if (s) s.getTracks().forEach(t => t.stop());
+        if (rafId) cancelAnimationFrame(rafId);
+      } catch {}
+    });
+  </script>
+</body>
+</html>
